@@ -1,7 +1,30 @@
+## 20.2
+
+* `aur-build`
+  + add `AUR_MAKEPKG_GNUPGHOME`, `--makepkg-gnupghome`
+  + propagate `LOGDEST` to `aur-chroot`
+
+* `aur-sync`
+  + add `--auto-key-retrieve`
+    - retrieve PGP keys to `AUR_SYNC_GNUPGHOME` keyring
+    - keyring defaults to `$XDG_DATA_HOME/aurutils/sync/gnupg`
+  + add diagnostic for tsort failure (#1039)
+ 
+## 20.1
+
+* `aur-chroot`
+  + avoid triggering `--status` when `--path` is given (#1181)
+
 ## 20
+
+* `aur-chroot`
+  + run `--status` if no modes are specified
 
 * `aur-sync`
   + move git `orderFile` to `XDG_CONFIG_HOME/aurutils/view/orderfile` (#1167)
+
+* `aur-view`
+  + define missing `XDG_CONFIG_HOME` (#1177)
 
 * `perl`
   + move `AUR::Repo` to `aur-repo-parse`
@@ -101,6 +124,7 @@
   + detect local repositories with `--chroot` configuration (#1135)
   + add `--clean` / `-C`, `--cleanbuild`
     - default build command changed to `aur build --syncdeps`
+  + add `aur-sync--filter` helper (#1136, #1140)
 
 * `aur(1)`
   + use `git-clean -ixd` to clean directories with `aur-gc`

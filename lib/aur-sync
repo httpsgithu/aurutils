@@ -6,8 +6,10 @@ argv0=sync
 XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 AURDEST=${AURDEST:-$XDG_CACHE_HOME/aurutils/$argv0}
 AUR_SYNC_USE_NINJA=${AUR_SYNC_USE_NINJA:-0}
+AUR_SYNC_GNUPGHOME=${AUR_SYNC_GNUPGHOME:-$XDG_DATA_HOME/aurutils/$argv0/gnupg}
 PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
 
 # Avoid CDPATH screwing with cd (#1047)
@@ -21,7 +23,7 @@ depends_args=() view_args=() filter_args=() fetch_args=() graph_args=() reparse_
 build=1 chkver_depth=2 download=1 view=1 provides=1 graph=1 keep_going=1
 
 # default options (disabled)
-rotate=0 update=0 repo_targets=0 columns=0
+rotate=0 update=0 repo_targets=0 columns=0 auto_key_retrieve=0
 
 args_csv() {
     # shellcheck disable=SC2155
@@ -72,6 +74,17 @@ usage() {
     exit 1
 }
 
+# Clarify tsort errors (#1039)
+diag_depcycle() {
+	echo >&2 'Error:'
+
+cat <<EOF | pr -to 4 >&2
+aur-$argv0 encountered a cycle while resolving dependencies. This may be caused
+by an error in the PKGBUILD or by cyclic checkdepends. For the latter, retry
+building the package(s) with --no-check.
+EOF
+}
+
 source /usr/share/makepkg/util/message.sh
 
 if [[ ! -v NO_COLOR ]] && [[ ! -v AUR_DEBUG ]]; then
@@ -86,7 +99,7 @@ if (( UID == 0 )) && [[ ! -v AUR_ASROOT ]]; then
 fi
 
 # option parsing
-opt_short='d:D:k:U:ACcfLnorRSTuv'
+opt_short='d:D:k:U:ACcfKLnorRSTuv'
 opt_long=('bind:' 'bind-rw:' 'database:' 'directory:' 'ignore:' 'root:'
           'makepkg-conf:' 'pacman-conf:' 'chroot' 'continue' 'force' 'ignore-arch'
           'log' 'no-confirm' 'no-ver' 'no-graph' 'no-sync' 'no-ver-argv' 'no-view'
@@ -94,11 +107,11 @@ opt_long=('bind:' 'bind-rw:' 'database:' 'directory:' 'ignore:' 'root:'
           'rebuild' 'rebuild-tree' 'rebuild-all' 'ignore-file:' 'remove'
           'provides-from:' 'new' 'prevent-downgrade' 'verify' 'makepkg-args:'
           'format:' 'no-check' 'keep-going:' 'user:' 'rebase' 'reset' 'ff' 'exclude:'
-          'columns' 'prefix' 'save:' 'clean' 'cleanbuild')
+          'columns' 'prefix' 'save:' 'clean' 'cleanbuild' 'auto-key-retrieve')
 opt_hidden=('dump-options' 'allan' 'ignorearch' 'ignorefile:' 'noconfirm'
             'nover' 'nograph' 'nosync' 'nover-argv' 'noview' 'noprovides' 'nobuild'
             'rebuildall' 'rebuildtree' 'rm-deps' 'gpg-sign' 'margs:' 'nocheck'
-            'no-checkdepends' 'nocheckdepends' 'optdepends' 'repo:')
+            'no-checkdepends' 'nocheckdepends' 'optdepends' 'repo:' 'autokeyretrieve')
 
 if opts=$(getopt -o "$opt_short" -l "$(args_csv "${opt_long[@]}" "${opt_hidden[@]}")" -n "$argv0" -- "$@"); then
     eval set -- "$opts"
@@ -146,6 +159,8 @@ while true; do
             view=0 ;;
         --noprovides|--no-provides)
             provides=0 ;;
+        -K|--auto-key-retrieve|--autokeyretrieve)
+            auto_key_retrieve=1 ;;
         --provides-from)
             shift; IFS=, read -a repo -r <<< "$1"
             repo_p+=("${repo[@]}")
@@ -368,7 +383,7 @@ aur sync--filter -p "$tmp"/depends.jsonl -f "$tmp"/filter >"$tmp"/graph
 # a less nice diagnostic on cycles), or fetches done in an arbitrary order
 # (e.g. sort -u) with checks for cycles done at build-time.
 if ! tsort <"$tmp"/graph >"$tmp"/queue; then
-    printf >&2 '%s: dependency cycle detected\n' "$argv0"
+    diag_depcycle
     exit 22
 fi
 
@@ -386,6 +401,31 @@ else
     xargs -a "$tmp"/queue stat >/dev/null || exit 2 # ensure all directories are available
 fi
 
+if (( auto_key_retrieve )); then
+    # shellcheck disable=SC2174
+    mkdir -pm 0700 -- "$AUR_SYNC_GNUPGHOME"
+    declare -A keys_uniq
+
+    # Retrieve unique set of gpg keys to be imported
+    while IFS= read -r path; do
+        if [[ -f $path/.SRCINFO ]]; then
+            mapfile -t keys < <(pacini "$path"/.SRCINFO 'validpgpkeys')
+
+            for key in "${keys[@]}"; do
+                keys_uniq[$key]=1
+            done
+        fi
+    done < "$tmp"/queue
+
+    if (( ${#keys_uniq[@]} )); then
+        printf >&2 '%s: importing key %s\n' "${!keys_uniq[@]}"
+        GNUPGHOME="$AUR_SYNC_GNUPGHOME" gpg --recv-keys "${!keys_uniq[@]}" >&2
+    fi
+
+    # Pass on verified keys to makepkg
+    build_args+=(--makepkg-gnupghome="$AUR_SYNC_GNUPGHOME")
+fi
+
 # Verify dependency tree (#20)
 if (( graph )); then
     if ! { while read -r pkg; do
@@ -398,7 +438,10 @@ if (( graph )); then
     fi <"$tmp"/queue >"$tmp"/graph
 
     # Recompute dependencies to include `provides` (#837)
-    tsort < "$tmp"/graph >"$tmp"/queue || exit 22
+    if ! tsort < "$tmp"/graph >"$tmp"/queue; then
+        diag_depcycle
+        exit 22
+    fi
 fi
 
 { # Sort dependencies (`aur-sync--ninja`, `--columns`)
